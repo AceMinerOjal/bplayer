@@ -20,18 +20,41 @@
 - `jq` (JSON parsing)
 - `playerctl` (media control)
 
+## Downloading Music (Recommended)
+
+For the **fastest** and **best** results with bplayer, use `yt-dlp` with the following command:
+
+```bash
+yt-dlp -x --audio-format opus --audio-quality 160K \
+  --output "%(title)s.%(ext)s" \
+  --embed-metadata --embed-thumbnail \
+  --convert-thumbnails jpg \
+  --ppa "ThumbnailsConvertor:-q:v 1 -vf 'scale=500:500:force_original_aspect_ratio=increase,crop=500:500'" \
+  --parse-metadata "%(title)s:%(meta_title)s" \
+  --extractor-args "youtube:player_client=android" \
+  <playlist-link>
+```
+
+This ensures:
+- **Embedded metadata** – Track title and artist display correctly in notifications
+- **Embedded thumbnails** – Album art appears in dunst notifications
+- **Optimized images** – 500×500 square thumbnails render properly
+- **Efficient codec** – Opus at 160K provides excellent quality with small file sizes
+
 ## Installation
 
-1. Clone or copy the `bplayer` script to your preferred location:
+1. Clone or copy the `bplayer` script and the fallback image to your preferred location:
    ```bash
    chmod +x bplayer
    sudo mv bplayer /usr/local/bin/bplayer
+   sudo mkdir -p /usr/local/share/bplayer
+   sudo cp no-image-found.svg /usr/local/share/bplayer/
    ```
 
 2. (Optional) Configure environment variables in your shell config (`~/.zshrc`):
    ```bash
    export BPLAYER_MUSIC_DIR="$HOME/Music"
-   export BPLAYER_DEFAULT_IMG="$HOME/Pictures/My-UIs/no-image-found.png"
+   export BPLAYER_DEFAULT_IMG="/usr/local/share/bplayer/no-image-found.svg"
    ```
 
 ## Usage

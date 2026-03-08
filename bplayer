@@ -6,8 +6,7 @@ set -eu
 
 # Configuration via environment variables (with defaults)
 SOCKET="${BPLAYER_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/mpvsocket}"
-SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
-DEFAULT_IMG="${BPLAYER_DEFAULT_IMG:-$SCRIPT_DIR/no-image-found.svg}"
+DEFAULT_IMG="${BPLAYER_DEFAULT_IMG:-/usr/local/share/bplayer/no-image-found.svg}"
 MUSIC_DIR="${BPLAYER_MUSIC_DIR:-$HOME/Music}"
 
 zmodload zsh/net/socket
@@ -45,7 +44,7 @@ wait_for_playlist() {
     local attempt=0 playlist
     while [[ $attempt -lt 50 ]]; do
         playlist=$(mpv_send '{"command": ["get_property", "playlist"]}' 2>/dev/null)
-        if [[ -n "$playlist" ]] && echo "$playlist" | jq -e '.data | length > 0' >/dev/null 2>&1; then
+        if [[ -n "$playlist" ]] && echo "$playlist" | jq -e '.data | length > 0 and .[0].filename != null' >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
