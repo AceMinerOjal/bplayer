@@ -3,40 +3,96 @@
 # Usage: bplayer [command]
 
 set -eu
+set -o pipefail
 
 # Configuration via environment variables (with defaults)
+SCRIPT_DIR="${0:A:h}"
 SOCKET="${BPLAYER_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/mpvsocket}"
-DEFAULT_IMG="${BPLAYER_DEFAULT_IMG:-/usr/local/share/bplayer/no-image-found.svg}"
+DEFAULT_IMG="${BPLAYER_DEFAULT_IMG:-}"
 MUSIC_DIR="${BPLAYER_MUSIC_DIR:-$HOME/Music}"
+typeset -gi MPV_REQUEST_ID=0
 
 zmodload zsh/net/socket
 
+if [[ -z "$DEFAULT_IMG" ]]; then
+    if [[ -f /usr/local/share/bplayer/no-image-found.svg ]]; then
+        DEFAULT_IMG="/usr/local/share/bplayer/no-image-found.svg"
+    else
+        DEFAULT_IMG="$SCRIPT_DIR/no-image-found.svg"
+    fi
+fi
+
+notify_msg() {
+    dunstify -a "mpv-control" "$@"
+}
+
+notify_error() {
+    notify_msg -u critical "mpv Error" "$1"
+}
+
+trim_whitespace() {
+    local value="${1-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    print -r -- "$value"
+}
+
+socket_exists() {
+    [[ -S "$SOCKET" ]]
+}
+
 # Check if mpv is running and socket exists
 cmd_check() {
-    pgrep -x mpv >/dev/null || { dunstify -a "mpv-control" -u critical "mpv Error" "mpv is not running."; return 1; }
-    [[ -S "$SOCKET" ]] || { dunstify -a "mpv-control" -u critical "mpv Error" "No IPC socket found."; return 1; }
+    local quiet=0
+    [[ "${1:-}" == "--quiet" ]] && quiet=1
+
+    pgrep -x mpv >/dev/null || {
+        (( quiet == 1 )) || notify_error "mpv is not running."
+        return 1
+    }
+    socket_exists || {
+        (( quiet == 1 )) || notify_error "No IPC socket found."
+        return 1
+    }
+}
+
+mpv_exchange() {
+    local payload="${1:?missing payload}"
+    local request_id="${2:?missing request id}"
+    local fd response
+
+    zsocket "$SOCKET" 2>/dev/null || return 1
+    fd=$REPLY
+    print -u$fd -r -- "$payload"
+    while read -u $fd response; do
+        if printf '%s' "$response" | jq -e --argjson request_id "$request_id" '(.request_id? // -1) == $request_id' >/dev/null 2>&1; then
+            print -r -- "$response"
+            exec {fd}>&-
+            return 0
+        fi
+    done
+    exec {fd}>&-
+    return 1
 }
 
 # Send command to mpv via IPC socket
 mpv_send() {
-    local fd response
-    zsocket "$SOCKET" 2>/dev/null || return 1
-    fd=$REPLY
-    print -u$fd "$1"
-    if read -u $fd response; then
-        print -r "$response"
-    fi
-    exec {fd}>&-
+    local request_id payload
+    ((MPV_REQUEST_ID += 1))
+    request_id=$MPV_REQUEST_ID
+
+    payload=$(printf '%s' "$1" | jq -c --argjson request_id "$request_id" '. + {request_id: $request_id}') || return 1
+    mpv_exchange "$payload" "$request_id"
 }
 
 # Wait for socket to be created (max 2 seconds)
 socket_wait() {
     local attempt=0
-    while [[ ! -S "$SOCKET" && $attempt -lt 20 ]]; do
+    while ! socket_exists && [[ $attempt -lt 20 ]]; do
         sleep 0.1
         ((attempt++))
     done
-    [[ -S "$SOCKET" ]] || return 1
+    socket_exists || return 1
 }
 
 # Wait for playlist to be loaded (max 5 seconds)
@@ -44,7 +100,7 @@ wait_for_playlist() {
     local attempt=0 playlist
     while [[ $attempt -lt 50 ]]; do
         playlist=$(mpv_send '{"command": ["get_property", "playlist"]}' 2>/dev/null)
-        if [[ -n "$playlist" ]] && echo "$playlist" | jq -e '.data | length > 0 and .[0].filename != null' >/dev/null 2>&1; then
+        if [[ -n "$playlist" ]] && printf '%s' "$playlist" | jq -e '.data | length > 0 and .[0].filename != null' >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
@@ -55,7 +111,52 @@ wait_for_playlist() {
 
 # Show playlist directory selector
 select_playlist_dir() {
-    find "$MUSIC_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tofi --prompt-text "Select playlist: "
+    [[ -d "$MUSIC_DIR" ]] || {
+        notify_error "Music directory not found: $MUSIC_DIR"
+        return 1
+    }
+
+    local choices
+    choices=$(find "$MUSIC_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+    [[ -n "$choices" ]] || {
+        notify_error "No playlists found in: $MUSIC_DIR"
+        return 1
+    }
+
+    print -r -- "$choices" | tofi --prompt-text "Select playlist: "
+}
+
+# Return sorted media files for a playlist directory.
+playlist_files() {
+    local playlist_dir="${1:?missing playlist dir}"
+    find "$playlist_dir" -maxdepth 1 -type f \
+        \( -iname '*.aac' -o -iname '*.alac' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' -o -iname '*.weba' -o -iname '*.wma' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' \) \
+        | sort
+}
+
+start_mpv() {
+    local -a files=("$@")
+
+    socket_exists && mpv_send '{"command": ["quit"]}' >/dev/null 2>&1 || true
+    rm -f "$SOCKET" 2>/dev/null || true
+
+    mpv --no-video --no-terminal --input-ipc-server="$SOCKET" "${files[@]}" 2>/dev/null &
+    socket_wait || return 1
+    wait_for_playlist || return 1
+}
+
+load_playlist_into_mpv() {
+    local file payload mode="replace"
+    local -a files=("$@")
+
+    mpv_send '{"command": ["playlist-clear"]}' >/dev/null
+    for file in "${files[@]}"; do
+        payload=$(jq -nc --arg file "$file" --arg mode "$mode" '{"command": ["loadfile", $file, $mode]}')
+        mpv_send "$payload" >/dev/null
+        mode="append"
+    done
+
+    wait_for_playlist
 }
 
 # Get loop status (internal helper)
@@ -79,7 +180,7 @@ get_loop_indicators() {
 
 # Build loop suffix for notifications
 get_loop_suffix() {
-    [[ -S "$SOCKET" ]] || { return; }
+    socket_exists || return 0
     local loop_data loop_file loop_playlist suffix=""
     loop_data=$(_get_loop_status)
     loop_file="${loop_data%%|*}"
@@ -91,17 +192,15 @@ get_loop_suffix() {
 
 # Launch mpv with playlist selection, then open track selector
 cmd_start() {
-    local selected
-    selected=$(select_playlist_dir)
+    local selected playlist_dir
+    local -a files
+    selected=$(select_playlist_dir) || exit 1
     [[ -z "$selected" ]] && exit 0
+    playlist_dir="$MUSIC_DIR/$selected"
+    files=("${(@f)$(playlist_files "$playlist_dir")}")
+    [[ ${#files[@]} -gt 0 ]] || { notify_error "No tracks found in: $selected"; exit 1; }
 
-    pkill mpv 2>/dev/null || true
-    rm -f "$SOCKET" 2>/dev/null || true
-
-    mpv --no-video --input-ipc-server="$SOCKET" "$MUSIC_DIR/$selected/" 2>/dev/null &
-    socket_wait || { dunstify -a "mpv-control" -u critical "mpv Error" "Socket not created."; exit 1; }
-    wait_for_playlist || { dunstify -a "mpv-control" -u critical "mpv Error" "Playlist not loaded."; exit 1; }
-
+    start_mpv "${files[@]}" || { notify_error "Failed to start mpv or load playlist."; exit 1; }
     cmd_select
 }
 
@@ -135,8 +234,8 @@ cmd_actions() {
         *"Seek +10s"*)         mpv_send '{"command": ["seek", 10]}' ;;
         *"Seek -1min"*)        mpv_send '{"command": ["seek", -60]}' ;;
         *"Seek +1min"*)        mpv_send '{"command": ["seek", 60]}' ;;
-        *"Restart Track"*)     mpv_send '{"command": ["seek", "absolute", 0]}' ;;
-        *"Toggle Shuffle"*)    mpv_send '{"command": ["cycle", "playlist-shuffle"]}' ;;
+        *"Restart Track"*)     mpv_send '{"command": ["seek", 0, "absolute"]}' ;;
+        *"Toggle Shuffle"*)    mpv_send '{"command": ["playlist-shuffle"]}' ;;
         *"Show Playlist"*)     cmd_select; return ;;
         *"Change"*)            cmd_change; return ;;
     esac
@@ -150,16 +249,15 @@ cmd_select() {
     playlist_raw=$(mpv_send '{"command": ["get_property", "playlist"]}')
     [[ -z "$playlist_raw" ]] && exit 1
 
-    # Parse JSON playlist: extract filename, remove path and extension, mark playing track
-    selection_list=$(echo "$playlist_raw" | jq -r '
+    selection_list=$(printf '%s' "$playlist_raw" | jq -r '
         .data | to_entries | .[] |
-        "\(.key + 1). \(.value.filename | split("/")[-1] | rtrimstr("." + (. | split(".")[-1])))\(if .value.playing then " 󰎈" else "" end)"
+        "\(.key + 1). \((.value.title // (.value.filename | split("/")[-1])) | sub("\\.[^.]+$"; ""))\(if .value.playing then " 󰎈" else "" end)"
     ')
 
     [[ -z "$selection_list" ]] && exit 0
 
     local selected index
-    selected=$(echo "$selection_list" | tofi --prompt-text "mpv playlist: " --require-match true) || exit 0
+    selected=$(print -r -- "$selection_list" | tofi --prompt-text "mpv playlist: " --require-match true) || exit 0
     index="${selected%%.*}"
     [[ "$index" =~ ^[0-9]+$ ]] || exit 0
 
@@ -168,29 +266,32 @@ cmd_select() {
 
 # Change to a different playlist directory
 cmd_change() {
-    local selected
-    selected=$(select_playlist_dir)
+    cmd_check || return 1
+
+    local selected playlist_dir
+    local -a files
+    selected=$(select_playlist_dir) || return 1
     [[ -z "$selected" ]] && return 0
+    playlist_dir="$MUSIC_DIR/$selected"
+    files=("${(@f)$(playlist_files "$playlist_dir")}")
+    [[ ${#files[@]} -gt 0 ]] || { notify_error "No tracks found in: $selected"; return 1; }
 
-    mpv_send '{"command": ["playlist-clear"]}' >/dev/null
-    mpv_send "{\"command\": [\"loadlist\", \"$MUSIC_DIR/$selected/\", \"replace\"]}" >/dev/null
+    load_playlist_into_mpv "${files[@]}" || { notify_error "Playlist not loaded."; return 1; }
 
-    wait_for_playlist || { dunstify -a "mpv-control" -u critical "mpv Error" "Playlist not loaded."; return 1; }
-
-    dunstify -a "mpv-control" "Playlist Changed" "Loaded: $selected"
+    notify_msg "Playlist Changed" "Loaded: $selected"
     cmd_select
 }
 
 # Show notifications for playback changes (runs continuously with playerctl)
 cmd_noti() {
-    local TEMP_DIR prev="" title artist
+    local TEMP_DIR prev="" title artist arturl p_status
     TEMP_DIR=$(mktemp -d /tmp/media_notif_XXXXXXXX)
-    trap 'rm -rf "$TEMP_DIR"' EXIT
+    trap "rm -rf '$TEMP_DIR'" EXIT
 
     playerctl -p mpv metadata --follow --format '{{status}}|{{title}}|{{artist}}|{{mpris:artUrl}}' | \
     while IFS='|' read -r p_status title artist arturl; do
-        title="${title## }"; title="${title%% }"
-        artist="${artist## }"; artist="${artist%% }"
+        title=$(trim_whitespace "$title")
+        artist=$(trim_whitespace "$artist")
         [[ -z "$title" && -z "$artist" ]] && continue
 
         local cur="$title|$artist|$p_status"
@@ -199,7 +300,16 @@ cmd_noti() {
 
         local img=""
         [[ -f "$DEFAULT_IMG" ]] && img="$DEFAULT_IMG"
-        [[ "$arturl" == *base64* ]] && { printf '%s' "${arturl#*,}" | base64 -d >"$TEMP_DIR/mpv-art.avif" 2>/dev/null || true; img="$TEMP_DIR/mpv-art.avif"; }
+        if [[ "$arturl" == *base64* ]]; then
+            printf '%s' "${arturl#*,}" | base64 -d >"$TEMP_DIR/mpv-art" 2>/dev/null || true
+            [[ -s "$TEMP_DIR/mpv-art" ]] && img="$TEMP_DIR/mpv-art"
+        elif [[ "$arturl" == file://* ]]; then
+            local decoded_path="${arturl#file://}"
+            decoded_path="${decoded_path//%20/ }"
+            [[ -f "$decoded_path" ]] && img="$decoded_path"
+        elif [[ -f "$arturl" ]]; then
+            img="$arturl"
+        fi
 
         local icon="󰓛"
         [[ "$p_status" == "Playing" ]] && icon=""
@@ -214,10 +324,10 @@ cmd_noti() {
 
 # Stop mpv and clean up socket
 cmd_stop() {
-    [[ -S "$SOCKET" ]] && { mpv_send '{"command": ["quit"]}' >/dev/null 2>&1; sleep 0.2; }
+    socket_exists && { mpv_send '{"command": ["quit"]}' >/dev/null 2>&1; sleep 0.2; }
     rm -f "$SOCKET" 2>/dev/null
     pkill mpv 2>/dev/null || true
-    dunstify -a "mpv-control" -u low -h string:x-dunst-stack-tag:mpv " Stopped"
+    notify_msg -u low -h string:x-dunst-stack-tag:mpv " Stopped"
 }
 
 # Show help
@@ -239,14 +349,16 @@ Note: Running 'bplayer' without arguments will:
   - Change playlist if mpv is already running"
 }
 
-# Main entry point
-if [[ $# -eq 0 ]]; then
-    if cmd_check 2>/dev/null; then
-        cmd_change
-    else
-        cmd_start
+main() {
+    if [[ $# -eq 0 ]]; then
+        if cmd_check --quiet 2>/dev/null; then
+            cmd_change
+        else
+            cmd_start
+        fi
+        return 0
     fi
-else
+
     case "$1" in
         start)   cmd_start ;;
         actions) cmd_actions ;;
@@ -256,6 +368,10 @@ else
         noti)    cmd_noti ;;
         check)   cmd_check ;;
         help)    cmd_help ;;
-        *)       print -u2 "Unknown command: $1"; cmd_help; exit 1 ;;
+        *)       print -u2 "Unknown command: $1"; cmd_help; return 1 ;;
     esac
+}
+
+if [[ "${BPLAYER_SOURCE_ONLY:-0}" != 1 ]]; then
+    main "$@"
 fi
